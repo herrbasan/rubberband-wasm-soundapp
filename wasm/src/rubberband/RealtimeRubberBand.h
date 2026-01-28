@@ -6,6 +6,7 @@
 #define RUBBERBAND_WEB_SRC_REALTIME_RUBBERBAND_H_
 
 #include <RubberBandStretcher.h>
+#include <emscripten/val.h>
 #include "../../lib/third-party/rubberband-3.0.0/src/common/RingBuffer.h"
 
 class RealtimeRubberBand {
@@ -26,7 +27,12 @@ class RealtimeRubberBand {
   void push(uintptr_t input_ptr, size_t sample_size);
 
   __attribute__((unused)) void pull(uintptr_t output_ptr, size_t sample_size);
-
+  
+  // SAB-to-SAB processing (uses emscripten::val for external JS memory)
+  void setSABBuffers(emscripten::val input_audio, emscripten::val input_control, size_t input_ring_size,
+                     emscripten::val output_audio, emscripten::val output_control, size_t output_ring_size);
+  void process();
+  
  private:
   void updateRatio();
 
@@ -46,6 +52,15 @@ class RealtimeRubberBand {
 
   size_t block_size_ = 512;
   const size_t kReserve_ = 8192;
+  
+  // SAB support (JavaScript TypedArrays)
+  emscripten::val input_audio_;
+  emscripten::val input_control_;
+  size_t input_ring_size_;
+  emscripten::val output_audio_;
+  emscripten::val output_control_;
+  size_t output_ring_size_;
+  bool sab_mode_;
 };
 
 #endif //RUBBERBAND_WEB_SRC_REALTIME_RUBBERBAND_H_

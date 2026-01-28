@@ -34,7 +34,13 @@ EMSCRIPTEN_BINDINGS(CLASS_RealtimeRubberBand) {
                   allow_raw_pointers())
 
         .function("getSamplesAvailable",
-                  &RealtimeRubberBand::getSamplesAvailable);
+                  &RealtimeRubberBand::getSamplesAvailable)
+        
+        .function("setSABBuffers",
+                  &RealtimeRubberBand::setSABBuffers)
+        
+        .function("process",
+                  &RealtimeRubberBand::process);
 }
 
 EMSCRIPTEN_BINDINGS(CLASS_RubberBandProcessor) {

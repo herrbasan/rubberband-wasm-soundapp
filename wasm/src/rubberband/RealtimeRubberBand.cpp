@@ -20,7 +20,14 @@ RealtimeRubberBand::RealtimeRubberBand(size_t sampleRate, size_t channel_count, 
     start_pad_samples_(0),
     start_delay_samples_(0),
   channel_count_(channel_count),
-  block_size_(block_size > 0 ? block_size : 512) {
+  block_size_(block_size > 0 ? block_size : 512),
+  input_audio_(emscripten::val::null()),
+  input_control_(emscripten::val::null()),
+  input_ring_size_(0),
+  output_audio_(emscripten::val::null()),
+  output_control_(emscripten::val::null()),
+  output_ring_size_(0),
+  sab_mode_(false) {
   if (sampleRate <= 0) {
     throw std::range_error("Sample rate has to be greater than 0");
   }
@@ -212,6 +219,128 @@ void RealtimeRubberBand::fetchProcessed() {
       output_buffer_[channel]->write(scratch_[channel], actual);
     }
   }
+}
+
+// SAB-to-SAB support
+void RealtimeRubberBand::setSABBuffers(emscripten::val input_audio, emscripten::val input_control, size_t input_ring_size,
+                                        emscripten::val output_audio, emscripten::val output_control, size_t output_ring_size) {
+  input_audio_ = input_audio;
+  input_control_ = input_control;
+  input_ring_size_ = input_ring_size;
+  output_audio_ = output_audio;
+  output_control_ = output_control;
+  output_ring_size_ = output_ring_size;
+  sab_mode_ = true;
+}
+
+void RealtimeRubberBand::process() {
+  if (!sab_mode_) return;
+  
+  // Control buffer layout (matches FFmpeg SAB):
+  // 0=WRITE_PTR, 1=READ_PTR, 2=STATE, etc.
+  const int WRITE_PTR = 0;
+  const int READ_PTR = 1;
+  
+  // Use Atomics.load to read atomic values
+  emscripten::val atomics = emscripten::val::global("Atomics");
+  const int32_t input_write = atomics.call<int>("load", input_control_, WRITE_PTR);
+  int32_t input_read = atomics.call<int>("load", input_control_, READ_PTR);
+  
+  // Calculate available input
+  int32_t input_available = input_write - input_read;
+  if (input_available < 0) input_available += input_ring_size_;
+  
+  // Only process if we have enough for block_size
+  if (input_available < (int32_t)block_size_) return;
+  
+  // BYPASS MODE: If pitch=1.0 and tempo=1.0, directly copy without RubberBand processing
+  const double current_pitch = stretcher_->getPitchScale();
+  const double current_tempo = stretcher_->getTimeRatio();
+  
+  // Tolerance for floating point comparison
+  const double bypass_tolerance = 0.001;
+  const bool is_bypass = (std::abs(current_pitch - 1.0) < bypass_tolerance) && 
+                          (std::abs(current_tempo - 1.0) < bypass_tolerance);
+  
+  if (is_bypass) {
+    // Direct passthrough - copy from input SAB to output SAB
+    const int32_t output_write = atomics.call<int>("load", output_control_, WRITE_PTR);
+    const int32_t output_read = atomics.call<int>("load", output_control_, READ_PTR);
+    int32_t output_space = output_read - output_write - 1;
+    if (output_space < 0) output_space += output_ring_size_;
+    
+    // Copy as much as we can fit
+    const int32_t to_copy = std::min(input_available, output_space);
+    if (to_copy <= 0) return;
+    
+    for (int32_t i = 0; i < to_copy; ++i) {
+      const size_t src_idx = ((input_read + i) % input_ring_size_) * 2;
+      const size_t dst_idx = ((output_write + i) % output_ring_size_) * 2;
+      for (size_t ch = 0; ch < channel_count_; ++ch) {
+        const float sample = input_audio_[src_idx + ch].as<float>();
+        output_audio_.set(dst_idx + ch, sample);
+      }
+    }
+    
+    // Update pointers
+    atomics.call<void>("store", input_control_, READ_PTR, (input_read + to_copy) % input_ring_size_);
+    atomics.call<void>("store", output_control_, WRITE_PTR, (output_write + to_copy) % output_ring_size_);
+    return;
+  }
+  
+  // PROCESSING MODE: Use RubberBand for pitch/tempo adjustment
+  
+  // CRITICAL: Always drain ALL available output first to prevent buffer overflow
+  // Even if we can't write it all to output SAB, we must retrieve it from RubberBand
+  while (true) {
+    auto available = stretcher_->available();
+    if (available <= 0) break;
+    
+    // Retrieve to scratch (drain internal buffer)
+    const size_t to_retrieve = std::min<size_t>(available, block_size_);
+    const size_t actual = stretcher_->retrieve(scratch_, to_retrieve);
+    if (actual == 0) break;
+    
+    // Try to write to output SAB (but continue even if buffer is full)
+    int32_t output_write = atomics.call<int>("load", output_control_, WRITE_PTR);
+    const int32_t output_read = atomics.call<int>("load", output_control_, READ_PTR);
+    int32_t output_space = output_read - output_write - 1;
+    if (output_space < 0) output_space += output_ring_size_;
+    
+    const size_t can_write = std::min<size_t>(actual, static_cast<size_t>(output_space));
+    
+    if (can_write > 0) {
+      // Interleave to output SAB
+      for (size_t i = 0; i < can_write; ++i) {
+        size_t dst_idx = ((output_write + i) % output_ring_size_) * 2;
+        for (size_t ch = 0; ch < channel_count_; ++ch) {
+          output_audio_.set(dst_idx + ch, scratch_[ch][i]);
+        }
+      }
+      output_write = (output_write + can_write) % output_ring_size_;
+      atomics.call<void>("store", output_control_, WRITE_PTR, output_write);
+    }
+    // If can_write < actual, we're discarding (actual - can_write) samples
+    // This is OK - prevents RubberBand buffer overflow
+  }
+  
+  // Now feed new input (RubberBand buffer is drained)
+  if (input_available < (int32_t)block_size_) return;
+  
+  // De-interleave from input SAB to scratch
+  for (size_t i = 0; i < block_size_; ++i) {
+    size_t src_idx = ((input_read + i) % input_ring_size_) * 2;
+    for (size_t ch = 0; ch < channel_count_; ++ch) {
+      scratch_[ch][i] = input_audio_[src_idx + ch].as<float>();
+    }
+  }
+  
+  // Update input read pointer
+  input_read = (input_read + block_size_) % input_ring_size_;
+  atomics.call<void>("store", input_control_, READ_PTR, input_read);
+  
+  // Feed to RubberBand
+  stretcher_->process(scratch_, block_size_, false);
 }
 
 void RealtimeRubberBand::updateRatio() {
